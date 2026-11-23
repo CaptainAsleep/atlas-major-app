@@ -64,12 +64,15 @@ export function useOwnerAuth() {
     return unsub;
   }, [user]);
 
-  async function signUp(email, password, name) {
+  async function signUp(email, password, name, organizerName = "") {
     const cred = await createUserWithEmailAndPassword(auth, email, password);
     if (name) await updateProfile(cred.user, { displayName: name });
     await setDoc(doc(db, "owners", cred.user.uid), {
       email,
       name: name || email.split("@")[0],
+      // Atlas Major (2026-11-23): the event company's public name, the
+      // default "Organizer" on new events. `name` stays the account holder.
+      ...(organizerName ? { organizerName } : {}),
       createdAt: serverTimestamp(),
     });
     return cred.user;
@@ -114,6 +117,11 @@ export function useOwnerAuth() {
     // above somehow hasn't run yet by the time this fires.
     await setDoc(doc(db, "owners", auth.currentUser.uid), { name }, { merge: true });
     await updateProfile(auth.currentUser, { displayName: name });
+  }
+
+  async function updateOrganizerName(organizerName) {
+    if (!auth.currentUser) return;
+    await setDoc(doc(db, "owners", auth.currentUser.uid), { organizerName }, { merge: true });
   }
 
   async function acceptTerms(version) {
@@ -194,5 +202,5 @@ export function useOwnerAuth() {
     await deleteUser(auth.currentUser);
   }
 
-  return { user, profile, authLoading, signUp, signIn, sendPasswordReset, signOut, updateOwnerName, acceptTerms, acceptOrganizerTerms, setAccountRoles, changePassword, deleteAccount };
+  return { user, profile, authLoading, signUp, signIn, sendPasswordReset, signOut, updateOwnerName, updateOrganizerName, acceptTerms, acceptOrganizerTerms, setAccountRoles, changePassword, deleteAccount };
 }

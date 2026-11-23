@@ -396,6 +396,7 @@ function LoginScreen({ signIn, signUp, sendPasswordReset }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
+  const [companyName, setCompanyName] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [resetSentTo, setResetSentTo] = useState("");
@@ -430,7 +431,8 @@ function LoginScreen({ signIn, signUp, sendPasswordReset }) {
     setBusy(true);
     try {
       if (mode === "signup") {
-        await signUp(email.trim(), password, name.trim());
+        if (MAJOR_APP && !companyName.trim()) { setError("Enter your event company's name."); setBusy(false); return; }
+        await signUp(email.trim(), password, name.trim(), MAJOR_APP ? companyName.trim() : "");
       } else {
         await signIn(email.trim(), password);
       }
@@ -479,6 +481,12 @@ function LoginScreen({ signIn, signUp, sendPasswordReset }) {
       <form onSubmit={handleSubmit}>
         {mode === "signup" && (
           <TextField label="Your Name" value={name} onChange={setName} placeholder="Full name" />
+        )}
+        {mode === "signup" && MAJOR_APP && (
+          <>
+            <TextField label="Event Company Name" value={companyName} onChange={setCompanyName} placeholder="e.g. Screaming Wombats" />
+            <p className="text-[10px] -mt-2 mb-3" style={{ ...body, color: T.ashFaint }}>Shown to players as the organizer of your events. Your name stays private.</p>
+          </>
         )}
         <TextField label="Email" value={email} onChange={setEmail} placeholder="you@example.com" type="email" />
         {mode !== "reset" && (
@@ -1530,7 +1538,7 @@ function RuleEditor({ rule, onChange }) {
           className="w-20 px-3 py-2 text-[13px] outline-none" style={inputStyle} />
         {rule.type === "event_type" && (
           <select value={rule.eventType} onChange={(e) => set("eventType", e.target.value)} className="flex-1 px-3 py-2 text-[13px] outline-none" style={inputStyle}>
-            {GAME_TYPES.map((g) => <option key={g.key} value={g.key}>{g.label}</option>)}
+            {PATCH_EVENT_TYPES.map((g) => <option key={g.key} value={g.key}>{g.label}</option>)}
           </select>
         )}
         {rule.type === "night" && (
@@ -1581,7 +1589,7 @@ function RulesForm({ value, onChange }) {
         </>
       )}
       <p className="text-[12px] p-2" style={{ ...body, color: T.ash, background: T.panelAlt, borderRadius: 6 }}>
-        {describeRules(manual ? [] : rules.map(cleanRule), GAME_TYPES)}
+        {describeRules(manual ? [] : rules.map(cleanRule), PATCH_EVENT_TYPES)}
       </p>
     </div>
   );
@@ -1787,7 +1795,7 @@ function FieldPatchesCard({ field, events }) {
                   <img src={p.imageUrl} alt="" className="w-10 h-10 flex-shrink-0" style={{ objectFit: "contain", opacity: p.active === false ? 0.4 : 1 }} />
                   <div className="flex-1 min-w-0">
                     <div className="text-[13px] font-semibold truncate" style={{ ...display, color: T.ash }}>{p.name}</div>
-                    <div className="text-[11px]" style={{ ...body, color: T.ashFaint }}>{describeRules(p.rules, GAME_TYPES)}</div>
+                    <div className="text-[11px]" style={{ ...body, color: T.ashFaint }}>{describeRules(p.rules, PATCH_EVENT_TYPES)}</div>
                   </div>
                   {p.active === false && <span className="text-[9px] font-semibold px-1.5 py-0.5" style={{ ...mono, color: T.ashDim, border: `1px solid ${T.line}`, borderRadius: T.rPill }}>RETIRED</span>}
                   <ChevronRight size={14} color={T.ashFaint} style={{ transform: expandedId === p.id ? "rotate(90deg)" : "none" }} />
@@ -2521,11 +2529,216 @@ const GAME_TYPES = [
   { key: "INDOOR", label: "Indoor" },
   { key: "TOURNAMENT", label: "Tournament" },
 ];
+// Patch rules can also target Major (organizer) events, which carry
+// type "MAJOR" instead of a game type (2026-11-23). Not offered in the
+// field event editor.
+const PATCH_EVENT_TYPES = [...GAME_TYPES, { key: "MAJOR", label: "Major" }];
 
 // The real landing page when an owner taps into one of their events — a
 // summary with real stats, not straight into the edit form. Mirrors
 // FieldOverviewScreen's exact pattern: view first, edit is one tap away
 // via the pencil icon.
+// ── Teams & Roles (2026-11-23) ──────────────────────────────────────────────
+// The editor shows Teams, one shared Roles list (spots per team) and Other
+// questions; it saves them as plain `selectionGroups` so the server, Stripe
+// metadata, roster and CSV keep working unchanged:
+//  - one team group  { kind: "team", label: "Team", required: true }
+//  - one role group per team { kind: "role", label: "Role", required: true,
+//    showIf: { groupId: <team group>, choiceId: <team> } } — the server only
+//    asks for (and only accepts) the role group of the picked team. Each
+//    role choice carries `roleKey`, the shared role it came from.
+//  - other questions { kind: "question" } (and any group saved by the old
+//    editor, which had no `kind`).
+// With roles but no teams, one role group with no showIf is saved.
+const NO_TEAM = "_none";
+const TEAM_GROUP_ID = "team";
+
+function centsToText(c) { return c ? String(c / 100) : ""; }
+function capToText(c) { return typeof c === "number" ? String(c) : ""; }
+
+function splitSelectionGroups(list) {
+  const all = (Array.isArray(list) ? list : []).filter((g) => g && g.id && Array.isArray(g.choices));
+  const teamGroup = all.find((g) => g.kind === "team") || null;
+  const roleGroups = all.filter((g) => g.kind === "role");
+  const teams = teamGroup
+    ? teamGroup.choices.map((c) => ({ id: c.id, label: c.label || "", price: centsToText(c.priceCents), capacity: capToText(c.capacity) }))
+    : [];
+  const roles = [];
+  const byKey = {};
+  const roleGroupIds = {};
+  roleGroups.forEach((g) => {
+    const teamId = g.showIf?.choiceId || NO_TEAM;
+    roleGroupIds[teamId] = g.id;
+    g.choices.forEach((c) => {
+      const key = c.roleKey || c.id;
+      if (!byKey[key]) {
+        byKey[key] = { key, label: c.label || "", price: centsToText(c.priceCents), spots: {}, choiceIds: {} };
+        roles.push(byKey[key]);
+      }
+      byKey[key].spots[teamId] = capToText(c.capacity);
+      byKey[key].choiceIds[teamId] = c.id;
+    });
+  });
+  return {
+    teamGroupId: teamGroup?.id || TEAM_GROUP_ID,
+    teams,
+    roles,
+    roleGroupIds,
+    questions: all.filter((g) => g.kind !== "team" && g.kind !== "role"),
+  };
+}
+
+function buildTeamRoleGroups(tr) {
+  const toCap = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) && n > 0 ? n : null; };
+  const toCents = (v) => Math.round((parsePrice(v) || 0) * 100);
+  const teams = tr.teams.filter((t) => t.label.trim());
+  const roles = tr.roles.filter((r) => r.label.trim());
+  const out = [];
+  const roleChoices = (teamId) => roles.map((r) => ({
+    id: r.choiceIds?.[teamId] || `${teamId}__${r.key}`,
+    roleKey: r.key,
+    label: r.label.trim(),
+    priceCents: toCents(r.price),
+    capacity: toCap(r.spots?.[teamId]),
+  }));
+  if (teams.length > 0) {
+    out.push({
+      id: tr.teamGroupId, kind: "team", label: "Team", required: true,
+      choices: teams.map((t) => ({ id: t.id, label: t.label.trim(), priceCents: toCents(t.price), capacity: toCap(t.capacity) })),
+    });
+    if (roles.length > 0) {
+      teams.forEach((t) => {
+        out.push({
+          id: tr.roleGroupIds?.[t.id] || `role_${t.id}`, kind: "role", label: "Role", required: true,
+          showIf: { groupId: tr.teamGroupId, choiceId: t.id },
+          choices: roleChoices(t.id),
+        });
+      });
+    }
+  } else if (roles.length > 0) {
+    out.push({ id: tr.roleGroupIds?.[NO_TEAM] || "role_all", kind: "role", label: "Role", required: true, choices: roleChoices(NO_TEAM) });
+  }
+  return out;
+}
+
+// Display label for a group: a team's role group reads "Green Team roles".
+function selectionGroupTitle(g, allGroups) {
+  if (g?.kind === "role" && g.showIf) {
+    const tg = (allGroups || []).find((x) => x.id === g.showIf.groupId);
+    const team = tg?.choices?.find((c) => c.id === g.showIf.choiceId);
+    if (team?.label) return `${team.label} roles`;
+  }
+  return g?.label || "";
+}
+
+// CSV columns for a booking's picks: every role group folds into one "Role"
+// column (a booking only ever has its own team's role).
+function selectionCsvColumns(groups) {
+  const list = Array.isArray(groups) ? groups : [];
+  const roleIds = list.filter((g) => g.kind === "role").map((g) => g.id);
+  const cols = [];
+  list.forEach((g) => {
+    if (g.kind === "role") {
+      if (g.id === roleIds[0]) cols.push({ label: "Role", ids: roleIds });
+    } else {
+      cols.push({ label: g.label, ids: [g.id] });
+    }
+  });
+  return cols;
+}
+
+function TeamsRolesEditor({ tr, setTr, lockedIds }) {
+  const inputStyle = { ...body, background: T.panelAlt, border: `1px solid ${T.line}`, borderRadius: 4, color: T.ash };
+  const headStyle = { ...mono, color: T.ashFaint, letterSpacing: "0.04em" };
+  const teamLocked = (t) => lockedIds.has(t.id);
+  const roleLocked = (r) => Object.values(r.choiceIds || {}).some((id) => lockedIds.has(id));
+  const teamCols = tr.teams.length > 0 ? tr.teams : [{ id: NO_TEAM, label: "" }];
+
+  const addTeam = () => setTr({ ...tr, teams: [...tr.teams, { id: `t${Date.now().toString(36)}${tr.teams.length}`, label: "", price: "", capacity: "" }] });
+  const updateTeam = (i, key, value) => setTr({ ...tr, teams: tr.teams.map((t, idx) => (idx === i ? { ...t, [key]: value } : t)) });
+  const removeTeam = (i) => setTr({ ...tr, teams: tr.teams.filter((_, idx) => idx !== i) });
+  const addRole = () => setTr({ ...tr, roles: [...tr.roles, { key: `r${Date.now().toString(36)}${tr.roles.length}`, label: "", price: "", spots: {}, choiceIds: {} }] });
+  const updateRole = (i, patch) => setTr({ ...tr, roles: tr.roles.map((r, idx) => (idx === i ? { ...r, ...patch } : r)) });
+  const removeRole = (i) => setTr({ ...tr, roles: tr.roles.filter((_, idx) => idx !== i) });
+
+  return (
+    <>
+      <div className="mb-2 flex items-center justify-between">
+        <label className="text-[10px] font-semibold uppercase" style={headStyle}>Teams</label>
+        <button onClick={addTeam} className="text-[12px] font-semibold transition-transform duration-100 active:scale-95" style={{ ...body, color: T.accent }}>+ Add Team</button>
+      </div>
+      <p className="text-[11px] mb-2 -mt-1" style={{ ...body, color: T.ashFaint }}>
+        Players pick one team when they book. Leave empty if your event has no teams.
+      </p>
+      {tr.teams.length > 0 && (
+        <div className="mb-3 p-3" style={{ background: T.panel, borderRadius: T.rCard, boxShadow: T.shadowMd }}>
+          <div className="flex gap-2 mb-1 text-[10px] font-semibold uppercase" style={headStyle}>
+            <span className="flex-1">Team name</span><span className="w-16">Spots</span><span className="w-16">Extra cost</span><span className="w-9" />
+          </div>
+          {tr.teams.map((t, i) => (
+            <div key={t.id} className="flex gap-2 mb-2">
+              <input value={t.label} onChange={(e) => updateTeam(i, "label", e.target.value)} placeholder="e.g. Green Team"
+                className="flex-1 min-w-0 px-2.5 py-2 text-[13px] bg-transparent outline-none" style={inputStyle} />
+              <input value={t.capacity} onChange={(e) => updateTeam(i, "capacity", e.target.value.replace(/[^0-9]/g, ""))} placeholder="No limit" inputMode="numeric"
+                className="w-16 px-2 py-2 text-[12px] bg-transparent outline-none" style={inputStyle} />
+              <input value={t.price} onChange={(e) => updateTeam(i, "price", e.target.value)} placeholder="$0" inputMode="decimal"
+                className="w-16 px-2 py-2 text-[12px] bg-transparent outline-none" style={inputStyle} />
+              {teamLocked(t) ? <span className="w-9 flex-shrink-0" /> : (
+                <button onClick={() => removeTeam(i)} aria-label="Remove team" className="w-9 h-9 flex-shrink-0 flex items-center justify-center transition-transform duration-100 active:scale-90" style={{ background: T.panelAlt, borderRadius: T.rPill }}>
+                  <Trash2 size={14} color={T.alert} />
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="mb-2 flex items-center justify-between">
+        <label className="text-[10px] font-semibold uppercase" style={headStyle}>Roles</label>
+        <button onClick={addRole} className="text-[12px] font-semibold transition-transform duration-100 active:scale-95" style={{ ...body, color: T.accent }}>+ Add Role</button>
+      </div>
+      <p className="text-[11px] mb-2 -mt-1" style={{ ...body, color: T.ashFaint }}>
+        {tr.teams.length > 0
+          ? "Roles are shared by every team. After picking a team, players pick one of its roles. Spots are per team."
+          : "Players pick one role when they book. Leave empty if your event has no roles."}
+      </p>
+      {tr.roles.map((r, i) => (
+        <div key={r.key} className="mb-3 p-3" style={{ background: T.panel, borderRadius: T.rCard, boxShadow: T.shadowMd }}>
+          <div className="flex gap-2 mb-1 text-[10px] font-semibold uppercase" style={headStyle}>
+            <span className="flex-1">Role name</span><span className="w-16">Extra cost</span><span className="w-9" />
+          </div>
+          <div className="flex gap-2 mb-2">
+            <input value={r.label} onChange={(e) => updateRole(i, { label: e.target.value })} placeholder="e.g. Rifleman, Medic, Sniper"
+              className="flex-1 min-w-0 px-2.5 py-2 text-[13px] bg-transparent outline-none" style={inputStyle} />
+            <input value={r.price} onChange={(e) => updateRole(i, { price: e.target.value })} placeholder="$0" inputMode="decimal"
+              className="w-16 px-2 py-2 text-[12px] bg-transparent outline-none" style={inputStyle} />
+            {roleLocked(r) ? <span className="w-9 flex-shrink-0" /> : (
+              <button onClick={() => removeRole(i)} aria-label="Remove role" className="w-9 h-9 flex-shrink-0 flex items-center justify-center transition-transform duration-100 active:scale-90" style={{ background: T.panelAlt, borderRadius: T.rPill }}>
+                <Trash2 size={14} color={T.alert} />
+              </button>
+            )}
+          </div>
+          <div className="text-[10px] font-semibold uppercase mb-1" style={headStyle}>Spots{tr.teams.length > 0 ? " per team" : ""}</div>
+          <div className="flex flex-wrap gap-2">
+            {teamCols.map((t) => (
+              <label key={t.id} className="flex items-center gap-1.5 text-[12px]" style={{ ...body, color: T.ashDim }}>
+                {t.label ? <span className="truncate max-w-[96px]">{t.label.trim() || "Team"}</span> : null}
+                <input value={r.spots?.[t.id] || ""} onChange={(e) => updateRole(i, { spots: { ...(r.spots || {}), [t.id]: e.target.value.replace(/[^0-9]/g, "") } })}
+                  placeholder="No limit" inputMode="numeric"
+                  className="w-20 px-2 py-1.5 text-[12px] bg-transparent outline-none" style={inputStyle} />
+              </label>
+            ))}
+          </div>
+        </div>
+      ))}
+      <p className="text-[11px] mb-4" style={{ ...body, color: T.ashFaint }}>
+        Spots: leave blank for no limit. Every person in a party takes a spot. Extra cost is added to the ticket price; leave blank for $0.
+        {(tr.teams.some(teamLocked) || tr.roles.some(roleLocked)) ? " Players have already booked, so existing teams and roles can be renamed or re-spotted but not removed." : ""}
+      </p>
+    </>
+  );
+}
+
 // Per-group head count for an organizer event's Team / Role / Options
 // groups: "Green 42/50, Red 38/50". Counts every head in a party (a booking
 // of 3 adds 3), the same way the server's hard cap does. A choice past its
@@ -2546,7 +2759,7 @@ function SelectionTally({ event, bookings }) {
     <div className="mb-4">
       {groups.map((g) => (
         <div key={g.id} className="p-3 mb-2" style={{ background: T.panel, borderRadius: T.rCard, boxShadow: T.shadowMd }}>
-          <div className="text-[10px] font-semibold uppercase mb-2" style={{ ...mono, color: T.ashFaint, letterSpacing: "0.04em" }}>{g.label}</div>
+          <div className="text-[10px] font-semibold uppercase mb-2" style={{ ...mono, color: T.ashFaint, letterSpacing: "0.04em" }}>{selectionGroupTitle(g, groups)}</div>
           <div className="flex flex-col gap-1.5">
             {g.choices.map((c) => {
               const n = taken[`${g.id}:${c.id}`] || 0;
@@ -2972,7 +3185,11 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
       capacity: typeof c.capacity === "number" ? String(c.capacity) : "",
     })),
   }));
-  const [groups, setGroups] = useState(toGroupRows(existing?.selectionGroups));
+  const [initialTr] = useState(() => splitSelectionGroups(existing?.selectionGroups));
+  const [teamsRoles, setTeamsRoles] = useState(initialTr);
+  // "Other questions": every group that isn't a team or role (including
+  // anything saved by the old Team / Role / Options editor).
+  const [groups, setGroups] = useState(toGroupRows(initialTr.questions));
   // Once an event has bookings, existing groups/choices can't be removed:
   // capacity counts are keyed on their ids. Renaming, repricing and
   // changing a cap stay allowed; new groups/choices can always be added.
@@ -2980,7 +3197,7 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
   if ((existing?.bookedCount || 0) > 0) {
     (existing?.selectionGroups || []).forEach((g) => { lockedIds.add(g.id); (g.choices || []).forEach((c) => lockedIds.add(c.id)); });
   }
-  const addGroup = () => setGroups([...groups, { id: `group_${Date.now()}_${groups.length}`, label: "", required: true, choices: [] }]);
+  const addGroup = () => setGroups([...groups, { id: `group_${Date.now()}_${groups.length}`, label: "", required: false, choices: [] }]);
   const updateGroup = (gi, patch) => setGroups(groups.map((g, i) => (i === gi ? { ...g, ...patch } : g)));
   const removeGroup = (gi) => setGroups(groups.filter((_, i) => i !== gi));
   const addGroupChoice = (gi) => updateGroup(gi, { choices: [...groups[gi].choices, { id: `choice_${Date.now()}_${groups[gi].choices.length}`, label: "", price: "", capacity: "" }] });
@@ -3012,7 +3229,8 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
       venueLat !== (typeof existing?.lat === "number" ? existing.lat : null) ||
       venueLng !== (typeof existing?.lng === "number" ? existing.lng : null) ||
       JSON.stringify(addons) !== JSON.stringify(toAddonRows(existing?.rentals)) ||
-      JSON.stringify(groups) !== JSON.stringify(toGroupRows(existing?.selectionGroups))
+      JSON.stringify(groups) !== JSON.stringify(toGroupRows(initialTr.questions)) ||
+      JSON.stringify(teamsRoles) !== JSON.stringify(initialTr)
     )) ||
     waiverText !== (existing?.waiver?.text || "") ||
     patchName !== (existing?.checkInPatch?.name || "") || patchImageUrl !== (existing?.checkInPatch?.imageUrl || null) ||
@@ -3157,9 +3375,9 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
       // Team/Role/Options groups. A group needs a label and at least one
       // labelled choice to be kept; a half-filled row is dropped rather
       // than saved broken. capacity is a hard seat cap (null = unlimited).
-      selectionGroups: groups
+      selectionGroups: [...buildTeamRoleGroups(teamsRoles), ...groups
         .map((g) => ({
-          id: g.id, label: g.label.trim(), required: g.required,
+          id: g.id, kind: "question", label: g.label.trim(), required: g.required,
           choices: g.choices.filter((c) => c.label.trim()).map((c) => {
             const cap = parseInt(c.capacity, 10);
             return {
@@ -3169,7 +3387,7 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
             };
           }),
         }))
-        .filter((g) => g.label && g.choices.length > 0),
+        .filter((g) => g.label && g.choices.length > 0)],
       rentals: addons
         .filter((r) => r.name.trim() && (parsePrice(r.price) || 0) > 0)
         .map((r) => {
@@ -3204,7 +3422,7 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
         : null;
     })(),
     maxCapacity: maxCapacity ? parseInt(maxCapacity, 10) : null,
-    type,
+    type: venueMode ? "MAJOR" : type,
     description: description.trim(),
     imageUrl: imageUrl || null,
     // Same shape the player app's waiver-signing flow already reads
@@ -3398,6 +3616,7 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
           </p>
         </div>
 
+        {!venueMode && (
         <div className="mb-3">
           <label className="text-[10px] font-semibold uppercase block mb-1" style={{ ...mono, color: T.ashFaint, letterSpacing: "0.04em" }}>Game Type</label>
           <div className="flex gap-2 flex-wrap">
@@ -3413,10 +3632,11 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
             ))}
           </div>
         </div>
+        )}
 
         {venueMode && (
           <>
-            <TextField label="Organizer" value={hostName} onChange={setHostName} placeholder="e.g. Screaming Wombats" />
+            <TextField label="Organizer (shown to players)" value={hostName} onChange={setHostName} placeholder="e.g. Screaming Wombats" />
             <Eyebrow>Venue</Eyebrow>
             <p className="text-[11px] mb-2 -mt-1" style={{ ...body, color: T.ashFaint }}>
               Where the event is happening. Players see this on the event page and use it to get directions.
@@ -3565,19 +3785,20 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
 
         {venueMode && (
         <>
+        <TeamsRolesEditor tr={teamsRoles} setTr={setTeamsRoles} lockedIds={lockedIds} />
         <div className="mb-2 flex items-center justify-between">
-          <label className="text-[10px] font-semibold uppercase" style={{ ...mono, color: T.ashFaint, letterSpacing: "0.04em" }}>Team / Role / Options</label>
-          <button onClick={addGroup} className="text-[12px] font-semibold transition-transform duration-100 active:scale-95" style={{ ...body, color: T.accent }}>+ Add Group</button>
+          <label className="text-[10px] font-semibold uppercase" style={{ ...mono, color: T.ashFaint, letterSpacing: "0.04em" }}>Other Questions</label>
+          <button onClick={addGroup} className="text-[12px] font-semibold transition-transform duration-100 active:scale-95" style={{ ...body, color: T.accent }}>+ Add Question</button>
         </div>
         <p className="text-[11px] mb-2 -mt-1" style={{ ...body, color: T.ashFaint }}>
-          Questions players answer when they book — which team, which role, attendee type. Each group is one question; players pick one answer, and it applies to everyone in their party. Give a choice a seat cap to stop bookings once it's full (every person in a party counts). An extra price is optional and is added on top of the ticket price.
+          Anything else players answer when they book, like attendee type or weapon class. Each question gets one answer per booking.
         </p>
         {groups.map((g, gi) => {
           const groupLocked = lockedIds.has(g.id);
           return (
             <div key={g.id} className="mb-3 p-3" style={{ background: T.panel, borderRadius: T.rCard, boxShadow: T.shadowMd }}>
               <div className="flex gap-2 mb-2">
-                <input value={g.label} onChange={(e) => updateGroup(gi, { label: e.target.value })} placeholder="Question, e.g. Team, Role"
+                <input value={g.label} onChange={(e) => updateGroup(gi, { label: e.target.value })} placeholder="Question, e.g. Attendee type"
                   className="flex-1 px-2.5 py-2 text-[13px] bg-transparent outline-none" style={{ ...body, background: T.panelAlt, border: `1px solid ${T.line}`, borderRadius: 4, color: T.ash }} />
                 {!groupLocked && (
                   <button onClick={() => removeGroup(gi)} className="w-9 h-9 flex-shrink-0 flex items-center justify-center transition-transform duration-100 active:scale-90" style={{ background: T.panelAlt, borderRadius: T.rPill }}>
@@ -3587,15 +3808,20 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
               </div>
               <label className="flex items-center gap-2 mb-2 text-[12px]" style={{ ...body, color: T.ashDim }}>
                 <input type="checkbox" checked={g.required} onChange={(e) => updateGroup(gi, { required: e.target.checked })} />
-                Players must choose one to book
+                Every player must answer
               </label>
+              {g.choices.length > 0 && (
+                <div className="flex gap-2 mb-1 text-[10px] font-semibold uppercase" style={{ ...mono, color: T.ashFaint, letterSpacing: "0.04em" }}>
+                  <span className="flex-1">Answer</span><span className="w-16">Extra cost</span><span className="w-16">Spots</span><span className="w-9" />
+                </div>
+              )}
               {g.choices.map((c, ci) => (
                 <div key={c.id} className="flex gap-2 mb-2">
-                  <input value={c.label} onChange={(e) => updateGroupChoice(gi, ci, "label", e.target.value)} placeholder="Choice, e.g. Green Team"
+                  <input value={c.label} onChange={(e) => updateGroupChoice(gi, ci, "label", e.target.value)} placeholder="e.g. Player, Media"
                     className="flex-1 min-w-0 px-2.5 py-2 text-[13px] bg-transparent outline-none" style={{ ...body, background: T.panelAlt, border: `1px solid ${T.line}`, borderRadius: 4, color: T.ash }} />
-                  <input value={c.price} onChange={(e) => updateGroupChoice(gi, ci, "price", e.target.value)} placeholder="+$0"
+                  <input value={c.price} onChange={(e) => updateGroupChoice(gi, ci, "price", e.target.value)} placeholder="$0"
                     className="w-16 px-2.5 py-2 text-[13px] bg-transparent outline-none" style={{ ...body, background: T.panelAlt, border: `1px solid ${T.line}`, borderRadius: 4, color: T.ash }} />
-                  <input value={c.capacity} onChange={(e) => updateGroupChoice(gi, ci, "capacity", e.target.value.replace(/[^0-9]/g, ""))} placeholder="Cap" inputMode="numeric"
+                  <input value={c.capacity} onChange={(e) => updateGroupChoice(gi, ci, "capacity", e.target.value.replace(/[^0-9]/g, ""))} placeholder="No limit" inputMode="numeric"
                     className="w-16 px-2.5 py-2 text-[13px] bg-transparent outline-none" style={{ ...body, background: T.panelAlt, border: `1px solid ${T.line}`, borderRadius: 4, color: T.ash }} />
                   {!lockedIds.has(c.id) && (
                     <button onClick={() => removeGroupChoice(gi, ci)} className="w-9 h-9 flex-shrink-0 flex items-center justify-center transition-transform duration-100 active:scale-90" style={{ background: T.panelAlt, borderRadius: T.rPill }}>
@@ -3604,9 +3830,9 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
                   )}
                 </div>
               ))}
-              <button onClick={() => addGroupChoice(gi)} className="text-[12px] font-semibold transition-transform duration-100 active:scale-95" style={{ ...body, color: T.accent }}>+ Add Choice</button>
+              <button onClick={() => addGroupChoice(gi)} className="text-[12px] font-semibold transition-transform duration-100 active:scale-95" style={{ ...body, color: T.accent }}>+ Add Answer</button>
               {groupLocked && (
-                <p className="text-[11px] mt-2" style={{ ...body, color: T.ashFaint }}>Players have already booked, so existing choices can be renamed or re-capped but not removed.</p>
+                <p className="text-[11px] mt-2" style={{ ...body, color: T.ashFaint }}>Players have already booked, so existing answers can be renamed or re-spotted but not removed.</p>
               )}
             </div>
           );
@@ -3937,14 +4163,16 @@ const NO_FIELDS = [];
 // Atlas Major first run: confirms the account is used as an event organizer.
 // Same owners/{uid} account as the Atlas Owners app, so a field owner who
 // signs in here keeps their field there and adds the organizer role.
-function MajorOptInScreen({ email, onContinue, onLogout }) {
+function MajorOptInScreen({ email, onContinue, onLogout, initialCompanyName = "", alreadyOrganizer = false }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [companyName, setCompanyName] = useState(initialCompanyName);
   const handleContinue = async () => {
+    if (!companyName.trim()) { setError("Enter your event company's name."); return; }
     setSaving(true);
     setError("");
     try {
-      await onContinue();
+      await onContinue(companyName.trim());
     } catch (err) {
       console.error("setAccountRoles failed:", err);
       setError("Couldn't save that. Try again.");
@@ -3955,7 +4183,7 @@ function MajorOptInScreen({ email, onContinue, onLogout }) {
     <div className="h-screen flex flex-col px-6 overflow-y-auto" style={flatBg}>
       <style>{FONTS}</style>
       <div className="pt-10 pb-4">
-        <h1 className="text-[20px] font-semibold mb-1" style={{ ...display, color: T.ash }}>Welcome to Atlas Major</h1>
+        <h1 className="text-[20px] font-semibold mb-1" style={{ ...display, color: T.ash }}>{alreadyOrganizer ? "Your event company" : "Welcome to Atlas Major"}</h1>
         <p className="text-[13px] mb-3" style={{ ...body, color: T.ashDim }}>
           Atlas Major is for event organizers. Create your events, set the venue for each one, sell tickets and get paid through Stripe, then check players in on game day.
         </p>
@@ -3963,8 +4191,10 @@ function MajorOptInScreen({ email, onContinue, onLogout }) {
           Signed in as {email}. If you also run a field, it stays in the Atlas Owners app with the same login.
         </p>
       </div>
+      <TextField label="Event Company Name" value={companyName} onChange={setCompanyName} placeholder="e.g. Screaming Wombats" />
+      <p className="text-[10px] -mt-2 mb-4" style={{ ...body, color: T.ashFaint }}>Shown to players as the organizer of your events. You can change it per event, or later in Settings.</p>
       {error && <p className="text-[12px] mb-3" style={{ ...body, color: T.alert }}>{error}</p>}
-      <PrimaryButton onClick={handleContinue} disabled={saving}>{saving ? "Saving…" : "Continue as an organizer"}</PrimaryButton>
+      <PrimaryButton onClick={handleContinue} disabled={saving}>{saving ? "Saving…" : alreadyOrganizer ? "Save" : "Continue as an organizer"}</PrimaryButton>
       <button onClick={onLogout} className="text-center text-[12px] mt-4 pb-8" style={{ ...body, color: T.ashFaint }}>Sign out</button>
     </div>
   );
@@ -4568,11 +4798,11 @@ function RosterScreen({ event, onBack, onOpenCheckIn, banned, bannedLoading, ban
             <button
               onClick={() => downloadCsv(
                 `${event.title} - Reserved Players.csv`,
-                ["Callsign", "Selected Option", ...(event.selectionGroups || []).map((g) => g.label), "Rentals", "Reserved At", "Checked In", "Checked In At", "Paid", "Amount Paid", "Refund Status", "Stripe Checkout Session ID"],
+                ["Callsign", "Selected Option", ...selectionCsvColumns(event.selectionGroups).map((col) => col.label), "Rentals", "Reserved At", "Checked In", "Checked In At", "Paid", "Amount Paid", "Refund Status", "Stripe Checkout Session ID"],
                 bookings.map((b) => [
                   b.callsign,
                   b.selectedChoiceLabel || "",
-                  ...(event.selectionGroups || []).map((g) => (b.selections || []).find((x) => x.groupId === g.id)?.choiceLabel || ""),
+                  ...selectionCsvColumns(event.selectionGroups).map((col) => (b.selections || []).find((x) => col.ids.includes(x.groupId))?.choiceLabel || ""),
                   (b.selectedRentals || []).map((r) => (r.qty > 1 ? `${r.qty}x ${r.name}` : r.name)).join(", "),
                   b.bookedAt?.toDate ? b.bookedAt.toDate().toLocaleString() : "",
                   b.checkedIn ? "Yes" : "No",
@@ -6399,7 +6629,7 @@ function OwnerFeedbackSection() {
   );
 }
 
-function SettingsScreen({ profile, user, updateOwnerName, changePassword, deleteAccount, setAccountRoles, isFieldOwner, isOrganizer, hasFields, onOpenBilling, onOpenPayouts, onOpenYearInReview, onOpenStaff, onLogout }) {
+function SettingsScreen({ profile, user, updateOwnerName, updateOrganizerName, changePassword, deleteAccount, setAccountRoles, isFieldOwner, isOrganizer, hasFields, onOpenBilling, onOpenPayouts, onOpenYearInReview, onOpenStaff, onLogout }) {
   // Organizer-only accounts have no field fee model to show.
   const showFieldFee = isFieldOwner || !isOrganizer;
   const [rolesSaving, setRolesSaving] = useState(false);
@@ -6408,6 +6638,28 @@ function SettingsScreen({ profile, user, updateOwnerName, changePassword, delete
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
+  const [companyName, setCompanyName] = useState(profile?.organizerName || "");
+  const [companySaving, setCompanySaving] = useState(false);
+  const [companySaved, setCompanySaved] = useState(false);
+  const [companyError, setCompanyError] = useState("");
+  useEffect(() => {
+    if (profile?.organizerName) setCompanyName(profile.organizerName);
+  }, [profile?.organizerName]);
+  const handleSaveCompany = async () => {
+    if (!companyName.trim() || !updateOrganizerName) return;
+    setCompanySaving(true);
+    setCompanyError("");
+    try {
+      await updateOrganizerName(companyName.trim());
+      setCompanySaved(true);
+      setTimeout(() => setCompanySaved(false), 2000);
+    } catch (err) {
+      console.error("updateOrganizerName failed:", err);
+      setCompanyError(`Couldn't save: ${err.code || err.message || "unknown error"}`);
+    } finally {
+      setCompanySaving(false);
+    }
+  };
 
   const [showPasswordForm, setShowPasswordForm] = useState(false);
   const [currentPassword, setCurrentPassword] = useState("");
@@ -6531,6 +6783,7 @@ function SettingsScreen({ profile, user, updateOwnerName, changePassword, delete
       <div className="px-6">
         <Eyebrow>Account</Eyebrow>
         <TextField label="Your Name" value={name} onChange={setName} />
+        {MAJOR_APP && <p className="text-[10px] -mt-2 mb-3" style={{ ...body, color: T.ashFaint }}>For your account. Players don't see it.</p>}
         <p className="text-[10px] font-semibold uppercase block mb-1" style={{ ...mono, color: T.ashFaint, letterSpacing: "0.04em" }}>Email</p>
         <p className="text-[13px] mb-3" style={{ ...body, color: T.ashDim }}>{user?.email}</p>
         {error && <p className="text-[12px] mb-2" style={{ ...body, color: T.alert }}>{error}</p>}
@@ -6538,6 +6791,18 @@ function SettingsScreen({ profile, user, updateOwnerName, changePassword, delete
         <div className="mb-6">
           <PrimaryButton onClick={handleSave} disabled={saving || !name.trim() || name.trim() === profile?.name}>{saving ? "Saving…" : "Save Name"}</PrimaryButton>
         </div>
+
+        {MAJOR_APP && (
+          <>
+            <TextField label="Event Company Name" value={companyName} onChange={setCompanyName} placeholder="e.g. Screaming Wombats" />
+            <p className="text-[10px] -mt-2 mb-3" style={{ ...body, color: T.ashFaint }}>Shown to players as the organizer. New events start with this name; you can still change it per event.</p>
+            {companyError && <p className="text-[12px] mb-2" style={{ ...body, color: T.alert }}>{companyError}</p>}
+            {companySaved && <p className="text-[12px] mb-2" style={{ ...body, color: T.good }}>Saved.</p>}
+            <div className="mb-6">
+              <PrimaryButton onClick={handleSaveCompany} disabled={companySaving || !companyName.trim() || companyName.trim() === (profile?.organizerName || "")}>{companySaving ? "Saving…" : "Save Company Name"}</PrimaryButton>
+            </div>
+          </>
+        )}
 
         {!MAJOR_APP && (
         <>
@@ -7497,7 +7762,7 @@ export default function App() {
     return () => window.removeEventListener("beforeinstallprompt", handler);
   }, []);
 
-  const { user, profile, authLoading, signUp, signIn, sendPasswordReset, signOut, updateOwnerName, acceptTerms, acceptOrganizerTerms, setAccountRoles, changePassword, deleteAccount } = useOwnerAuth();
+  const { user, profile, authLoading, signUp, signIn, sendPasswordReset, signOut, updateOwnerName, updateOrganizerName, acceptTerms, acceptOrganizerTerms, setAccountRoles, changePassword, deleteAccount } = useOwnerAuth();
 
   // App-level, not scoped to any one screen — a real gap in the earlier
   // version: mobile Safari can silently reload a backgrounded tab to free
@@ -7604,6 +7869,9 @@ export default function App() {
   // Atlas Major: one-time confirmation that turns the organizer role on.
   // Waits for the real field list so a field owner keeps fieldOwner: true.
   const needsOrganizerOptIn = MAJOR_APP && !!profile && profile.accountRoles?.organizer !== true && !myFieldsLoading;
+  // Atlas Major (2026-11-23): organizers name their event company once
+  // (existing accounts are asked on their next visit).
+  const needsCompanyName = MAJOR_APP && !!profile && profile.accountRoles?.organizer === true && !String(profile.organizerName || "").trim();
   // Organizer-only accounts don't owe the field-owner agreement. Anyone not
   // clearly organizer-only keeps the original gate, so existing owners see
   // exactly what they saw before.
@@ -7700,11 +7968,16 @@ export default function App() {
     }
   } else if (rolesUndetermined) {
     content = <LoadingScreen />;
-  } else if (needsOrganizerOptIn) {
+  } else if (needsOrganizerOptIn || needsCompanyName) {
     content = (
       <MajorOptInScreen
         email={user.email}
-        onContinue={() => setAccountRoles({ fieldOwner: !!profile?.accountRoles?.fieldOwner || realMyFields.length > 0, organizer: true })}
+        initialCompanyName={profile?.organizerName || ""}
+        alreadyOrganizer={!needsOrganizerOptIn}
+        onContinue={async (companyName) => {
+          await updateOrganizerName(companyName);
+          if (needsOrganizerOptIn) await setAccountRoles({ fieldOwner: !!profile?.accountRoles?.fieldOwner || realMyFields.length > 0, organizer: true });
+        }}
         onLogout={handleLogout}
       />
     );
@@ -7802,7 +8075,7 @@ export default function App() {
         field={venueMode ? null : activeField}
         venueMode={venueMode}
         ownerUid={user.uid}
-        defaultHostName={(allMyEvents || []).find((e) => e.isMajor && e.hostName)?.hostName || profile.name || ""}
+        defaultHostName={profile.organizerName || (allMyEvents || []).find((e) => e.isMajor && e.hostName)?.hostName || profile.name || ""}
         payoutsEnabled={!!profile.payoutsEnabled}
         existing={editingEvent}
         onBack={closeOverlay}
@@ -7872,6 +8145,7 @@ export default function App() {
           profile={profile}
           user={user}
           updateOwnerName={updateOwnerName}
+          updateOrganizerName={updateOrganizerName}
           changePassword={changePassword}
           deleteAccount={deleteAccount}
           setAccountRoles={setAccountRoles}
