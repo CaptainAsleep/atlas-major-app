@@ -2906,6 +2906,11 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
   // new event so an owner has to consciously opt into free rather than
   // silently getting it by leaving a field untouched.
   const [isFreeEvent, setIsFreeEvent] = useState(!!existing && isBlankPriceText(existing?.price));
+  // Organizer fee model, chosen per event (2026-11-23). New events start on
+  // pass-to-player; an existing event with nothing saved has always absorbed.
+  // firestore.rules locks it once the event has a booking.
+  const [feeModel, setFeeModel] = useState(existing ? (existing.feeModel === "pass_to_player" ? "pass_to_player" : "absorb") : "pass_to_player");
+  const feeLocked = (existing?.bookedCount || 0) > 0;
   const priceBeforeFreeToggle = React.useRef(price);
   const toggleFreeEvent = (checked) => {
     setIsFreeEvent(checked);
@@ -3137,6 +3142,7 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
     // from an Atlas field.
     ...(venueMode ? {
       hostName: hostName.trim(),
+      feeModel,
       fieldName: venueName.trim(),
       venueName: venueName.trim(),
       address: address.trim(),
@@ -3513,12 +3519,49 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
             Heads up — since "{price.trim()}" isn't a plain number, this event won't collect any payment in the app. Enter a plain number (e.g. 25) for a flat ticket price.
           </p>
         )}
-        {venueMode && !isFreeEvent && (
-          <p className="text-[11px] mb-3 -mt-1" style={{ ...body, color: T.ashFaint }}>
-            One flat price per ticket. Atlas's fee (3.5% + $1.30 per ticket, no cap) comes out of your payout — players pay exactly the price you set.
-            {!payoutsEnabled && <span style={{ color: T.alert }}> Payouts aren't set up yet, so you can save a paid event as a draft but not publish it.</span>}
-          </p>
-        )}
+        {venueMode && !isFreeEvent && (() => {
+          // Same math as the server: 3.5% + $1.30 per ticket, no cap.
+          const ticketCents = Math.round((parsePrice(price) || 0) * 100);
+          const feeCents = ticketCents > 0 ? Math.round(ticketCents * 0.035) + 130 : 0;
+          const usd = (cents) => `$${(cents / 100).toFixed(2)}`;
+          const options = [
+            { key: "pass_to_player", title: "Pass to player", body: "Atlas's fee is added at checkout. You keep your full ticket price.", pays: ticketCents + feeCents, keeps: ticketCents },
+            { key: "absorb", title: "Absorb the fee", body: "Players pay exactly your ticket price. Atlas's fee comes out of your payout.", pays: ticketCents, keeps: ticketCents - feeCents },
+          ];
+          return (
+            <div className="mb-3 -mt-1">
+              <p className="text-[10px] font-semibold uppercase mb-1" style={{ ...mono, color: T.ashFaint, letterSpacing: "0.04em" }}>Atlas fee (3.5% + $1.30 per ticket, no cap)</p>
+              <div className="flex flex-col gap-2">
+                {options.map((o) => {
+                  const on = feeModel === o.key;
+                  return (
+                    <button
+                      key={o.key}
+                      type="button"
+                      disabled={feeLocked}
+                      onClick={() => setFeeModel(o.key)}
+                      className="w-full p-3 flex items-start gap-3 text-left"
+                      style={{ background: T.panel, borderRadius: T.rCard, boxShadow: T.shadowMd, outline: on ? `2px solid ${T.accent}` : "2px solid transparent", outlineOffset: -2, opacity: feeLocked && !on ? 0.5 : 1 }}
+                    >
+                      <div className="w-4 h-4 mt-0.5 flex-shrink-0 rounded-full" style={{ border: `1.5px solid ${on ? T.accent : T.line}`, background: on ? T.accent : "transparent" }} />
+                      <div>
+                        <div className="text-[13px] font-semibold" style={{ ...display, color: T.ash }}>{o.title}</div>
+                        <div className="text-[11px]" style={{ ...body, color: T.ashDim }}>{o.body}</div>
+                        {ticketCents > 0 && (
+                          <div className="text-[11px] mt-1" style={{ ...mono, color: T.ashFaint }}>Player pays {usd(o.pays)} · You keep {usd(o.keeps)}</div>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[11px] mt-2" style={{ ...body, color: T.ashFaint }}>
+                {feeLocked ? "Locked because this event already has bookings." : "One flat price per ticket. You can change this until the first booking."}
+                {!payoutsEnabled && <span style={{ color: T.alert }}> Payouts aren't set up yet, so you can save a paid event as a draft but not publish it.</span>}
+              </p>
+            </div>
+          );
+        })()}
 
         {venueMode && (
         <>
@@ -4337,7 +4380,7 @@ function RosterScreen({ event, onBack, onOpenCheckIn, banned, bannedLoading, ban
         ? confirmGrant.booking.entryPriceCents * Math.max(1, confirmGrant.booking.attendeeCount || 1)
         : Math.max(0, confirmGrant.booking.amountPaidCents
             - (confirmGrant.booking.selectedRentals || []).reduce((s, r) => s + (typeof r.priceCents === "number" ? r.priceCents * (Number.isInteger(r.qty) && r.qty > 0 ? r.qty : 1) : 0), 0)
-            - (profile?.feeModel !== "absorb" && !event.isMajor ? (confirmGrant.booking.bookingFeeCents || 0) : 0)))
+            - ((event.isMajor ? event.feeModel === "pass_to_player" : profile?.feeModel !== "absorb") ? (confirmGrant.booking.bookingFeeCents || 0) : 0)))
     : 0;
 
   const handleConfirmGrant = async () => {
@@ -6557,7 +6600,7 @@ function SettingsScreen({ profile, user, updateOwnerName, changePassword, delete
                 {showFieldFee ? "Organizer events: " : ""}3.5% + $1.30 per ticket
               </span>
               <span className="text-[11px] block mt-0.5" style={{ ...body, color: T.ashFaint }}>
-                No cap. Comes out of your payout — players pay exactly the price you set.
+                No cap. You choose per event: pass it to players at checkout, or absorb it from your payout.
               </span>
             </div>
           </>
