@@ -7807,7 +7807,10 @@ export default function App() {
         existing={editingEvent}
         onBack={closeOverlay}
         createEvent={createEvent}
-        createMajorEvent={createMajorEvent}
+        // Test organizer accounts (admin-set owners.testAccount) stamp every
+        // new event testEvent: true, so players never see it; firestore.rules
+        // requires the stamp to match the account.
+        createMajorEvent={(uid, data, id) => createMajorEvent(uid, { ...data, testEvent: profile?.testAccount === true }, id)}
         updateEvent={updateEvent}
         newEventId={newEventId}
         allFields={allFields}
@@ -7916,6 +7919,11 @@ export default function App() {
       style={{ background: T.void }}
     >
       <style>{FONTS}</style>
+      {profile?.testAccount === true && (
+        <div className="px-4 py-1 text-center text-[10px] font-semibold uppercase" style={{ ...mono, background: T.alert, color: "#fff", letterSpacing: "0.06em" }}>
+          Test account · events are hidden from players
+        </div>
+      )}
       <div className="flex-1 min-h-0 relative">
         {content}
         {showNav && <OwnerBottomNav active={activeTab} onNavigate={setActiveTab} />}
