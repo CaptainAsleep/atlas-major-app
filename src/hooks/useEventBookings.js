@@ -1,0 +1,329 @@
+import { useEffect, useState } from "react";
+import { collection, doc, getDoc, getDocs, onSnapshot, orderBy, query, serverTimestamp, writeBatch } from "firebase/firestore";
+import { auth, db } from "../lib/firebase";
+
+// Real bookings for one event — a genuine commitment to attend, not just
+// interest. Every booking is guaranteed to already have a signed waiver if
+// the event required one, since that's enforced at the Firestore rules
+// level on the booking write itself, not just in the player app's UI.
+export function useEventBookings(eventId) {
+  const [bookings, setBookings] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!eventId) {
+      setBookings([]);
+      setLoading(false);
+      return;
+    }
+    const unsub = onSnapshot(
+      query(collection(db, "events", eventId, "bookings"), orderBy("bookedAt")),
+      (snap) => {
+        // isTest bookings (internal QR check-in rehearsals, created by
+        // scripts/add-test-bookings.mjs) are left out of the roster, its
+        // check-in counts and the After-Action Report. Scanning them still
+        // works: checkInPlayer reads the booking doc directly.
+        setBookings(snap.docs.map((d) => d.data()).filter((b) => !b.isTest));
+        setLoading(false);
+      },
+      (err) => {
+        console.error("useEventBookings error:", err);
+        setLoading(false);
+      }
+    );
+    return unsub;
+  }, [eventId]);
+
+  return { bookings, bookingsLoading: loading };
+}
+
+// One-shot count of who favorited/expressed interest in one event - used
+// by the After-Action Report's Interested -> Reserved conversion figure
+// (2026-09-28). A live listener isn't needed here: this only ever reads
+// for a past event on a screen someone deliberately opened, not
+// something that needs to update while they're staring at it.
+export function useEventInterestedCount(eventId) {
+  const [interestedCount, setInterestedCount] = useState(0);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!eventId) {
+      setInterestedCount(0);
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    getDocs(collection(db, "events", eventId, "interested"))
+      .then((snap) => {
+        if (!cancelled) setInterestedCount(snap.size);
+      })
+      .catch((err) => {
+        console.error("useEventInterestedCount error:", err);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [eventId]);
+
+  return { interestedCount, interestedCountLoading: loading };
+}
+
+// Shared by both the QR scanner and manual search-based check-in, so
+// there's exactly one place that knows how a check-in actually gets
+// written (both mirrored copies — see the comment below) rather than two
+// copies of that logic that could quietly drift apart.
+// Private child snapshots for one booking (legal name, DOB, guardian name
+// and phone, waiver ref) — readable only by the field owner (and the
+// guardian) per firestore.rules. Empty for a solo booking, and on any
+// failure: a child's details being unreadable must never block check-in.
+export async function fetchAttendeeDetails(eventId, uid) {
+  try {
+    const snap = await getDocs(collection(db, "events", eventId, "bookings", uid, "attendeeDetails"));
+    return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  } catch (err) {
+    console.error("fetchAttendeeDetails error:", err);
+    return [];
+  }
+}
+
+// True when a booking has child profiles on it. A parent's child-only
+// booking (guardianPlaying:false, 2026-10-21) with one child has
+// attendeeCount 1 but still has attendeeDetails.
+export function bookingHasChildren(b) {
+  return (b?.attendeeCount || 1) > 1 || b?.guardianPlaying === false;
+}
+
+// uid -> [attendee details], loaded once per set of party bookings (solo
+// bookings have none, so they cost nothing).
+export function useAttendeeDetails(eventId, bookings) {
+  const [byUid, setByUid] = useState({});
+  const key = bookings.filter(bookingHasChildren).map((b) => b.uid).sort().join(",");
+
+  useEffect(() => {
+    if (!eventId || !key) {
+      setByUid({});
+      return;
+    }
+    let cancelled = false;
+    Promise.all(key.split(",").map(async (uid) => [uid, await fetchAttendeeDetails(eventId, uid)])).then((entries) => {
+      if (!cancelled) setByUid(Object.fromEntries(entries));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [eventId, key]);
+
+  return byUid;
+}
+
+// method: how the check-in happened — "qr" (scan) or "name" (manual
+// list). Recorded on both docs for the Admin portal's check-in method
+// stats; "code" check-ins go through the checkInByCode Cloud Function.
+export async function checkInPlayer(eventId, uid, method = "name") {
+  const bookingRef = doc(db, "events", eventId, "bookings", uid);
+  const snap = await getDoc(bookingRef);
+  if (!snap.exists()) {
+    return { ok: false, reason: "not-booked" };
+  }
+  const data = snap.data();
+  if (data.checkedIn) {
+    const attendees = bookingHasChildren(data) ? await fetchAttendeeDetails(eventId, uid) : [];
+    return { ok: false, reason: "already-checked-in", callsign: data.callsign, attendees, guardianPlaying: data.guardianPlaying !== false };
+  }
+  // Both mirrored copies, not just the event's — a booking exists as two
+  // documents (one under the event for the owner's roster, one under the
+  // player for their own Schedule tab), and only the second one is what
+  // the achievement engine and the player's own UI actually read. Missing
+  // this was a real bug: check-in-based patches could never fire, since
+  // the copy they check never learned a check-in happened at all.
+  const batch = writeBatch(db);
+  const checkInMethod = method === "qr" ? "qr" : "name";
+  // checkedInBy (2026-10-27, Field Staff Logins): who did this check-in —
+  // the owner or one of their staff. firestore.rules requires it to be the
+  // caller's own uid (and requires it outright for staff).
+  const checkedInBy = auth.currentUser?.uid;
+  batch.update(bookingRef, { checkedIn: true, checkedInAt: serverTimestamp(), checkInMethod, checkedInBy });
+  batch.update(doc(db, "users", uid, "bookings", eventId), { checkedIn: true, checkedInAt: serverTimestamp(), checkInMethod, checkedInBy });
+  await batch.commit();
+  // Check-in stays booking-level: one scan checks in the whole party. The
+  // attendee list is only for display (who just walked in).
+  const attendees = bookingHasChildren(data) ? await fetchAttendeeDetails(eventId, uid) : [];
+  // guardianPlaying false = the parent booked only their child(ren); the
+  // booking's callsign is the parent who booked, not a player.
+  return { ok: true, callsign: data.callsign, attendees, guardianPlaying: data.guardianPlaying !== false };
+}
+
+// Parses the exact same "atlas:checkin:{eventId}:{uid}" payload the player
+// app's QR code already generates, verifies it matches the event actually
+// being scanned into, then delegates to the same check-in logic manual
+// check-in uses. Returns a result object rather than throwing, so the
+// scanner UI can show a clear message for every outcome without a
+// try/catch around each distinct failure case.
+export async function checkInFromScan(rawText, eventId) {
+  const parts = (rawText || "").split(":");
+  if (parts.length !== 4 || parts[0] !== "atlas" || parts[1] !== "checkin") {
+    // A player's Refer a Friend QR (Profile → Invite Friends) is an app
+    // link with ?ref=<uid> — easy to show by mistake at the gate.
+    if (/[?&]ref=[^&\s]+/.test(rawText || "")) return { ok: false, reason: "referral-code" };
+    return { ok: false, reason: "not-atlas-code" };
+  }
+  const [, , scannedEventId, uid] = parts;
+  if (scannedEventId !== eventId) {
+    return { ok: false, reason: "wrong-event" };
+  }
+  return checkInPlayer(eventId, uid, "qr");
+}
+
+
+// Real per-booking financial records across every one of this owner's
+// events, for the Analytics screen's financial breakdowns (total, by
+// month, by event, by field, CSV export). Same reasoning as the admin
+// portal's version — each event's own bookings subcollection, fetched
+// directly rather than a collectionGroup("bookings") query, which would
+// double-count against the player app's separate per-user mirror copy
+// (see useAdminData.js's comment for the full explanation of why that
+// shape exists).
+//
+// One-shot per distinct set of event ids rather than a live listener per
+// event — refetches whenever the owner's event list actually changes
+// (new event created, one edited), which is "fresh enough" for a screen
+// someone glances at, not something that needs to update mid-keystroke.
+//
+// Returns one record per paid booking rather than a single reduced
+// total, so the screen can group by month/event/field itself without a
+// separate fetch per breakdown. netCents (amountPaidCents minus Atlas's
+// bookingFeeCents) is the owner's own share — the actual dollars that
+// land in their connected Stripe account via the destination charge —
+// not Atlas's own cut, which wouldn't mean anything useful shown back to
+// a field owner.
+export function useOwnerFinancials(events) {
+  const [records, setRecords] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const eventIdsKey = events.map((e) => e.id).join(",");
+
+  useEffect(() => {
+    if (events.length === 0) {
+      setRecords([]);
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    Promise.all(events.map((e) => getDocs(collection(db, "events", e.id, "bookings")).then((snap) => ({ event: e, snap }))))
+      .then((results) => {
+        if (cancelled) return;
+        const out = [];
+        results.forEach(({ event, snap }) => {
+          snap.docs.forEach((d) => {
+            const b = d.data();
+            if (b.isTest) return; // internal test booking, never revenue
+            if (!b.paid || typeof b.amountPaidCents !== "number") return;
+            const bookingFeeCents = typeof b.bookingFeeCents === "number" ? b.bookingFeeCents : 0;
+            out.push({
+              eventId: event.id,
+              eventTitle: event.title,
+              fieldId: event.fieldId,
+              fieldName: event.fieldName,
+              eventDate: event.endDate || event.date,
+              bookedAt: b.bookedAt,
+              amountPaidCents: b.amountPaidCents,
+              bookingFeeCents,
+              netCents: b.amountPaidCents - bookingFeeCents,
+            });
+          });
+        });
+        setRecords(out);
+        setLoading(false);
+      })
+      .catch((err) => {
+        console.error("useOwnerFinancials error:", err);
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+    // eventIdsKey, not events itself — events is a fresh array reference
+    // on every parent render (from useOwnerEvents' onSnapshot), which
+    // would otherwise refetch every single render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eventIdsKey]);
+
+  return { records, financialsLoading: loading };
+}
+
+// Real per-booking + per-interest records across every one of this
+// owner's events, for the reservation-side Analytics metrics
+// (reservations over time, check-in/no-show rate, interest-to-booking
+// conversion, new vs. returning players) — deliberately a separate hook
+// from useOwnerFinancials above rather than an extension of it, even
+// though both fetch the same per-event `bookings` subcollections. That
+// hook's paid-only filter and missing uid are exactly right for the
+// money reporting it powers; reshaping it to also serve these
+// count-based metrics risks the one code path the revenue numbers
+// depend on. The real trade-off: this doubles the Firestore reads
+// against `bookings` whenever the Analytics screen is open (once here,
+// once in useOwnerFinancials) — accepted in exchange for never touching
+// the financial hook.
+export function useOwnerReservationStats(events) {
+  const [bookings, setBookings] = useState([]);
+  const [interested, setInterested] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const eventIdsKey = events.map((e) => e.id).join(",");
+
+  useEffect(() => {
+    if (events.length === 0) {
+      setBookings([]);
+      setInterested([]);
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    Promise.all([
+      Promise.all(events.map((e) => getDocs(collection(db, "events", e.id, "bookings")).then((snap) => ({ event: e, snap })))),
+      Promise.all(events.map((e) => getDocs(collection(db, "events", e.id, "interested")).then((snap) => ({ event: e, snap })))),
+    ])
+      .then(([bookingResults, interestedResults]) => {
+        if (cancelled) return;
+        const allBookings = [];
+        bookingResults.forEach(({ event, snap }) => {
+          snap.docs.forEach((d) => {
+            const b = d.data();
+            if (b.isTest) return; // internal test booking, not a real reservation
+            allBookings.push({
+              eventId: event.id,
+              eventTitle: event.title,
+              fieldId: event.fieldId,
+              fieldName: event.fieldName,
+              eventDate: event.endDate || event.date,
+              uid: b.uid || d.id,
+              bookedAt: b.bookedAt,
+              checkedIn: !!b.checkedIn,
+              paid: !!b.paid,
+            });
+          });
+        });
+        const allInterested = [];
+        interestedResults.forEach(({ event, snap }) => {
+          snap.docs.forEach((d) => {
+            allInterested.push({ eventId: event.id, uid: d.data().uid || d.id });
+          });
+        });
+        setBookings(allBookings);
+        setInterested(allInterested);
+        setLoading(false);
+      })
+      .catch((err) => {
+        console.error("useOwnerReservationStats error:", err);
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+    // eventIdsKey, not events itself — same reasoning as useOwnerFinancials
+    // above (a fresh array reference every render would refetch constantly).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eventIdsKey]);
+
+  return { reservationBookings: bookings, reservationInterested: interested, reservationStatsLoading: loading };
+}
