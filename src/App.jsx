@@ -3363,7 +3363,7 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
   // Organizer fee model, chosen per event (2026-11-23). New events start on
   // pass-to-player; an existing event with nothing saved has always absorbed.
   // firestore.rules locks it once the event has a booking.
-  const [feeModel, setFeeModel] = useState(existing ? (existing.feeModel === "pass_to_player" ? "pass_to_player" : "absorb") : "pass_to_player");
+  const [feeModel, setFeeModel] = useState(existing ? (["pass_to_player", "split_processing"].includes(existing.feeModel) ? existing.feeModel : "absorb") : "pass_to_player");
   const feeLocked = (existing?.bookedCount || 0) > 0;
   const priceBeforeFreeToggle = React.useRef(price);
   const toggleFreeEvent = (checked) => {
@@ -4006,9 +4006,12 @@ function EventEditScreen({ field, venueMode = false, ownerUid, defaultHostName =
           // Same math as the server: 3.5% + $1.30 per ticket, no cap.
           const ticketCents = Math.round((parsePrice(price) || 0) * 100);
           const feeCents = ticketCents > 0 ? Math.round(ticketCents * 0.035) + 130 : 0;
+          // Card processing estimate (same as functions/fees.js): 2.9% + $0.30.
+          const processingCents = ticketCents > 0 ? Math.min(Math.round(ticketCents * 0.029) + 30, feeCents) : 0;
           const usd = (cents) => `$${(cents / 100).toFixed(2)}`;
           const options = [
             { key: "pass_to_player", title: "Pass to player", body: "Atlas's fee is added at checkout. You keep your full ticket price.", pays: ticketCents + feeCents, keeps: ticketCents },
+            { key: "split_processing", title: "Absorb Atlas fee, pass card processing", body: "Players pay card payment processing (2.9% + $0.30) at checkout. Atlas's platform fee comes out of your payout.", pays: ticketCents + processingCents, keeps: ticketCents - (feeCents - processingCents) },
             { key: "absorb", title: "Absorb the fee", body: "Players pay exactly your ticket price. Atlas's fee comes out of your payout.", pays: ticketCents, keeps: ticketCents - feeCents },
           ];
           return (
